@@ -5,7 +5,7 @@ Captures images from a webcam, overlays an optional caption, and sends
 the result directly to the default Windows printer via the GDI API.
 
 Requirements (install with pip):
-    pip install opencv-python pillow pywin32 numpy scipy
+    pip install opencv-python pillow pywin32 numpy
 
 Run:
     python PhotoBooth.py
@@ -17,6 +17,7 @@ import threading
 import queue
 import os
 import time
+import winsound
 from datetime import datetime
 
 import cv2
@@ -62,39 +63,93 @@ COUNTDOWN_SECONDS = 3
 BURST_COUNT       = 3
 BURST_DELAY       = 2
 
-# Camera effects — (display name, internal key)
 EFFECTS = [
-    ("None",             "none"),
-    ("Mirror Left",      "mirror_left"),
-    ("Mirror Right",     "mirror_right"),
-    ("Kaleidoscope",     "kaleidoscope"),
-    ("Fisheye",          "fisheye"),
-    ("Bulge",            "bulge"),
-    ("Pinch",            "pinch"),
-    ("Twist",            "twist"),
-    ("Dent",             "dent"),
+    ("None",         "none"),
+    ("Mirror Left",  "mirror_left"),
+    ("Mirror Right", "mirror_right"),
+    ("Kaleidoscope", "kaleidoscope"),
+    ("Fisheye",      "fisheye"),
+    ("Bulge",        "bulge"),
+    ("Pinch",        "pinch"),
+    ("Twist",        "twist"),
+    ("Dent",         "dent"),
 ]
 EFFECT_DISPLAY_NAMES = [e[0] for e in EFFECTS]
 EFFECT_KEYS          = {e[0]: e[1] for e in EFFECTS}
+
+# Sound frequencies (Hz) and durations (ms)
+SND_BEEP_FREQ    = 880    # countdown tick
+SND_BEEP_MS      = 120
+SND_CAPTURE_FREQ = 1400   # shutter "boop" — first tone
+SND_CAPTURE_MS   = 80
+SND_CAPTURE2_FREQ = 1800  # second tone (two-tone boop)
+SND_CAPTURE2_MS  = 120
+
+
+# ---------------------------------------------------------------------------
+# Sound helpers  (non-blocking — run in daemon thread)
+# ---------------------------------------------------------------------------
+
+def _play_beep():
+    """Short high beep for countdown ticks."""
+    winsound.Beep(SND_BEEP_FREQ, SND_BEEP_MS)
+
+
+def _play_capture():
+    """Two-tone ascending boop for shutter."""
+    winsound.Beep(SND_CAPTURE_FREQ,  SND_CAPTURE_MS)
+    winsound.Beep(SND_CAPTURE2_FREQ, SND_CAPTURE2_MS)
+
+
+def play_async(fn):
+    threading.Thread(target=fn, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Image adjustments  (operate on BGR numpy arrays)
+# ---------------------------------------------------------------------------
+
+def apply_adjustments(bgr: np.ndarray,
+                      brightness: float,   # -100 … +100, 0 = neutral
+                      contrast:   float,   # -100 … +100, 0 = neutral
+                      exposure:   float,   # -100 … +100, 0 = neutral (EV-style)
+                      shadows:    float,   # -100 … +100, 0 = neutral
+                      ) -> np.ndarray:
+    """Apply brightness, contrast, exposure and shadow lift to a BGR frame."""
+    img = bgr.astype(np.float32)
+
+    # Exposure: multiplicative EV-style scale (±2 stops)
+    ev_scale = 2.0 ** (exposure / 50.0)   # exposure=100 → ×4, exposure=-100 → ×0.25
+    img *= ev_scale
+
+    # Brightness: simple additive offset
+    img += brightness * 2.55              # map ±100 → ±255
+
+    # Contrast: scale around mid-grey (128)
+    c_factor = (contrast + 100) / 100.0  # 0 … 2
+    img = (img - 128) * c_factor + 128
+
+    # Shadows: lift the dark tones only (gamma-curve in the shadows)
+    # Positive shadow = brighten darks; negative = crush them
+    if shadows != 0:
+        norm = img / 255.0
+        norm = np.clip(norm, 0, 1)
+        shadow_strength = shadows / 100.0
+        # Apply only where luminance < 0.5
+        mask = 1.0 - np.clip(norm * 2.0, 0, 1)   # 1 in pure black, 0 at mid-grey
+        img += mask * shadow_strength * 80
+
+    return np.clip(img, 0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------------------
 # Camera effects  (operate on BGR numpy arrays)
 # ---------------------------------------------------------------------------
 
-def _remap_effect(bgr: np.ndarray, map_x: np.ndarray, map_y: np.ndarray) -> np.ndarray:
-    return cv2.remap(bgr, map_x, map_y, interpolation=cv2.INTER_LINEAR,
+def _remap(bgr, map_x, map_y):
+    return cv2.remap(bgr, map_x, map_y,
+                     interpolation=cv2.INTER_LINEAR,
                      borderMode=cv2.BORDER_REFLECT)
-
-
-def _make_polar_maps(h, w):
-    """Shared polar coordinate grids used by several effects."""
-    cx, cy  = w / 2.0, h / 2.0
-    ys, xs  = np.mgrid[0:h, 0:w].astype(np.float32)
-    dx, dy  = xs - cx, ys - cy
-    r       = np.sqrt(dx**2 + dy**2)
-    theta   = np.arctan2(dy, dx)
-    return cx, cy, dx, dy, r, theta
 
 
 def apply_effect(bgr: np.ndarray, effect_key: str) -> np.ndarray:
@@ -104,79 +159,65 @@ def apply_effect(bgr: np.ndarray, effect_key: str) -> np.ndarray:
     h, w = bgr.shape[:2]
     cx, cy = w / 2.0, h / 2.0
 
-    # ── Mirror Left: left half mirrored to fill the whole frame ──────
     if effect_key == "mirror_left":
         left = bgr[:, :w // 2]
         return np.hstack([left, cv2.flip(left, 1)])
 
-    # ── Mirror Right: right half mirrored ────────────────────────────
     if effect_key == "mirror_right":
         right = bgr[:, w // 2:]
         return np.hstack([cv2.flip(right, 1), right])
 
-    # ── Kaleidoscope: 4-quadrant mirror ──────────────────────────────
     if effect_key == "kaleidoscope":
-        top_left = bgr[:h // 2, :w // 2]
-        top      = np.hstack([top_left, cv2.flip(top_left, 1)])
-        bottom   = cv2.flip(top, 0)
-        return np.vstack([top, bottom])
+        tl   = bgr[:h // 2, :w // 2]
+        top  = np.hstack([tl, cv2.flip(tl, 1)])
+        return np.vstack([top, cv2.flip(top, 0)])
 
-    # ── All remaining effects use polar remap ─────────────────────────
-    _, _, dx, dy, r, theta = _make_polar_maps(h, w)
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    dx, dy = xs - cx, ys - cy
+    r      = np.sqrt(dx**2 + dy**2)
+    theta  = np.arctan2(dy, dx)
 
     if effect_key == "fisheye":
-        # Barrel distortion: compress centre outwards
-        max_r  = min(cx, cy)
-        r_norm = r / max_r
-        r_new  = max_r * (r_norm ** 1.6)
-        map_x  = (cx + r_new * np.cos(theta)).astype(np.float32)
-        map_y  = (cy + r_new * np.sin(theta)).astype(np.float32)
-        return _remap_effect(bgr, map_x, map_y)
+        max_r = min(cx, cy)
+        r_new = max_r * (np.clip(r / max_r, 0, 1) ** 1.6)
+        return _remap(bgr,
+                      (cx + r_new * np.cos(theta)).astype(np.float32),
+                      (cy + r_new * np.sin(theta)).astype(np.float32))
 
     if effect_key == "bulge":
-        # Pushes pixels outward from the centre
-        max_r  = min(cx, cy)
-        r_norm = np.clip(r / max_r, 0, 1)
-        r_new  = max_r * np.sqrt(r_norm)
-        map_x  = (cx + r_new * np.cos(theta)).astype(np.float32)
-        map_y  = (cy + r_new * np.sin(theta)).astype(np.float32)
-        return _remap_effect(bgr, map_x, map_y)
+        max_r = min(cx, cy)
+        r_new = max_r * np.sqrt(np.clip(r / max_r, 0, 1))
+        return _remap(bgr,
+                      (cx + r_new * np.cos(theta)).astype(np.float32),
+                      (cy + r_new * np.sin(theta)).astype(np.float32))
 
     if effect_key == "pinch":
-        # Pulls pixels inward toward the centre
-        max_r  = min(cx, cy)
-        r_norm = np.clip(r / max_r, 0, 1)
-        r_new  = max_r * (r_norm ** 2.0)
-        map_x  = (cx + r_new * np.cos(theta)).astype(np.float32)
-        map_y  = (cy + r_new * np.sin(theta)).astype(np.float32)
-        return _remap_effect(bgr, map_x, map_y)
+        max_r = min(cx, cy)
+        r_new = max_r * (np.clip(r / max_r, 0, 1) ** 2.0)
+        return _remap(bgr,
+                      (cx + r_new * np.cos(theta)).astype(np.float32),
+                      (cy + r_new * np.sin(theta)).astype(np.float32))
 
     if effect_key == "twist":
-        # Rotates pixels by an angle proportional to their distance from centre
-        max_r      = min(cx, cy)
-        twist_amt  = 2.5   # radians at the centre
-        angle      = twist_amt * (1.0 - np.clip(r / max_r, 0, 1))
-        t_new      = theta + angle
-        r_clamped  = np.clip(r, 0, max_r)
-        map_x      = (cx + r_clamped * np.cos(t_new)).astype(np.float32)
-        map_y      = (cy + r_clamped * np.sin(t_new)).astype(np.float32)
-        return _remap_effect(bgr, map_x, map_y)
+        max_r  = min(cx, cy)
+        angle  = 2.5 * (1.0 - np.clip(r / max_r, 0, 1))
+        t_new  = theta + angle
+        rc     = np.clip(r, 0, max_r)
+        return _remap(bgr,
+                      (cx + rc * np.cos(t_new)).astype(np.float32),
+                      (cy + rc * np.sin(t_new)).astype(np.float32))
 
     if effect_key == "dent":
-        # Horizontal sine-wave warp — looks like a dented mirror
-        frequency  = 3.0
-        amplitude  = h * 0.06
-        map_x      = (np.mgrid[0:h, 0:w][1]).astype(np.float32)
-        map_y      = (np.mgrid[0:h, 0:w][0]
-                      + amplitude * np.sin(map_x / w * 2 * np.pi * frequency)
-                      ).astype(np.float32)
-        return _remap_effect(bgr, map_x, map_y)
+        map_x = np.mgrid[0:h, 0:w][1].astype(np.float32)
+        map_y = (np.mgrid[0:h, 0:w][0]
+                 + h * 0.06 * np.sin(map_x / w * 6 * np.pi)).astype(np.float32)
+        return _remap(bgr, map_x, map_y)
 
     return bgr
 
 
 # ---------------------------------------------------------------------------
-# Caption helpers
+# Caption / timestamp / countdown helpers
 # ---------------------------------------------------------------------------
 
 def _load_pil_font(font_filename: str, size: int) -> ImageFont.FreeTypeFont:
@@ -187,61 +228,66 @@ def _load_pil_font(font_filename: str, size: int) -> ImageFont.FreeTypeFont:
         return ImageFont.load_default()
 
 
+def _draw_outlined_text(draw, xy, text, font, fill=(255,255,255,255),
+                         stroke_width=3, stroke_fill=(0,0,0,200),
+                         align="left", anchor=None):
+    """Unified helper: draw text with outline using multiline_text."""
+    kwargs = dict(font=font, fill=fill,
+                  stroke_width=stroke_width, stroke_fill=stroke_fill,
+                  align=align)
+    if anchor:
+        kwargs["anchor"] = anchor
+    draw.multiline_text(xy, text, **kwargs)
+
+
 def _apply_caption(pil_img, text, font_name, font_size, position):
-    """Render centred multi-line caption with strong outline onto the image."""
     if not text.strip():
         return pil_img
 
     img  = pil_img.copy().convert("RGBA")
     w, h = img.size
+    font = _load_pil_font(FONTS.get(font_name, "arial.ttf"), font_size)
 
-    font_file = FONTS.get(font_name, "arial.ttf")
-    font      = _load_pil_font(font_file, font_size)
-
-    # Measure the full multi-line block using align="center"
-    dummy = ImageDraw.Draw(img)
-    bbox  = dummy.multiline_textbbox((0, 0), text, font=font, align="center")
-    tw    = bbox[2] - bbox[0]
-    th    = bbox[3] - bbox[1]
+    draw = ImageDraw.Draw(img)
+    bbox = draw.multiline_textbbox((0, 0), text, font=font, align="center")
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
 
     PADDING = 12
     pos = position.lower()
-
-    # Horizontal: left/right/centre
-    if "left" in pos:
-        tx = PADDING
-    elif "right" in pos:
-        tx = w - tw - PADDING
-    else:
-        tx = (w - tw) // 2
-
-    # Vertical: top/bottom/centre
-    if "top" in pos:
-        ty = PADDING
-    elif "bottom" in pos:
-        ty = h - th - PADDING * 4
-    else:
-        ty = (h - th) // 2
+    tx = (PADDING if "left" in pos
+          else w - tw - PADDING if "right" in pos
+          else (w - tw) // 2)
+    ty = (PADDING if "top" in pos
+          else h - th - PADDING * 4 if "bottom" in pos
+          else (h - th) // 2)
 
     stroke = int(min(font_size / 6, 8))
-    draw   = ImageDraw.Draw(img)
-    draw.multiline_text(
-        (tx, ty), text, font=font,
-        fill=(255, 255, 255, 255),
-        stroke_width=stroke,
-        stroke_fill=(0, 0, 0, 200),
-        align="center",
-    )
+    _draw_outlined_text(draw, (tx, ty), text, font,
+                         stroke_width=stroke, align="center")
+    return img.convert("RGB")
 
+
+def _apply_timestamp(pil_img, font_size=22):
+    """Render a small timestamp in the bottom-right corner."""
+    img  = pil_img.copy().convert("RGBA")
+    w, h = img.size
+    font = _load_pil_font("arialbd.ttf", font_size)
+
+    ts   = datetime.now().strftime("%y-%m-%d  %H:%M:%S")
+    draw = ImageDraw.Draw(img)
+    bbox = draw.textbbox((0, 0), ts, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+    PAD = 10
+    tx  = w - tw - PAD
+    ty  = h - th - PAD
+
+    _draw_outlined_text(draw, (tx, ty), ts, font, stroke_width=2)
     return img.convert("RGB")
 
 
 def _apply_countdown(pil_img, number):
-    """
-    Overlay a large countdown digit CENTRED on the image.
-    Preview-only — never called before printing.
-    Uses anchor='mm' (middle-middle) so Pillow centres the glyph perfectly.
-    """
+    """Large centred countdown digit — preview only, never printed."""
     img  = pil_img.copy().convert("RGBA")
     w, h = img.size
     cx, cy = w // 2, h // 2
@@ -253,14 +299,11 @@ def _apply_countdown(pil_img, number):
     except Exception:
         font = ImageFont.load_default()
 
-    text = str(number)
-
-    # Measure via textbbox with anchor "mm" to get the true visual extent
+    text  = str(number)
     dummy = ImageDraw.Draw(img)
     bbox  = dummy.textbbox((cx, cy), text, font=font, anchor="mm")
     r_pad = max(bbox[2] - bbox[0], bbox[3] - bbox[1]) // 2 + 36
 
-    # Dark circle behind digit
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     ImageDraw.Draw(overlay).ellipse(
         [cx - r_pad, cy - r_pad, cx + r_pad, cy + r_pad],
@@ -268,16 +311,12 @@ def _apply_countdown(pil_img, number):
     )
     img = Image.alpha_composite(img, overlay)
 
-    # Draw digit centred using anchor "mm"
     stroke = int(min(font_size / 6, 14))
     ImageDraw.Draw(img).text(
-        (cx, cy), text, font=font,
-        anchor="mm",
+        (cx, cy), text, font=font, anchor="mm",
         fill=(255, 255, 255, 255),
-        stroke_width=stroke,
-        stroke_fill=(0, 0, 0, 220),
+        stroke_width=stroke, stroke_fill=(0, 0, 0, 220),
     )
-
     return img.convert("RGB")
 
 
@@ -286,7 +325,6 @@ def _apply_countdown(pil_img, number):
 # ---------------------------------------------------------------------------
 
 def print_image(pil_image: Image.Image) -> None:
-    """Send a PIL Image to the default Windows printer using GDI."""
     pil_image    = pil_image.rotate(-90, expand=True)
     printer_name = win32print.GetDefaultPrinter()
     hprinter     = win32print.OpenPrinter(printer_name)
@@ -294,15 +332,15 @@ def print_image(pil_image: Image.Image) -> None:
     try:
         hdc = win32ui.CreateDC()
         hdc.CreatePrinterDC(printer_name)
-        printer_x = hdc.GetDeviceCaps(win32con.HORZRES)
-        printer_y = hdc.GetDeviceCaps(win32con.VERTRES)
-        img_w, img_h = pil_image.size
-        scale  = min(printer_x / img_w, printer_y / img_h)
-        new_w  = int(img_w * scale)
-        new_h  = int(img_h * scale)
+        px = hdc.GetDeviceCaps(win32con.HORZRES)
+        py = hdc.GetDeviceCaps(win32con.VERTRES)
+        iw, ih = pil_image.size
+        scale  = min(px / iw, py / ih)
         hdc.StartDoc("Photo Booth")
         hdc.StartPage()
-        ImageWin.Dib(pil_image).draw(hdc.GetHandleOutput(), (0, 0, new_w, new_h))
+        ImageWin.Dib(pil_image).draw(
+            hdc.GetHandleOutput(), (0, 0, int(iw * scale), int(ih * scale))
+        )
         hdc.EndPage()
         hdc.EndDoc()
         hdc.DeleteDC()
@@ -315,11 +353,6 @@ def print_image(pil_image: Image.Image) -> None:
 # ---------------------------------------------------------------------------
 
 class CameraThread(threading.Thread):
-    """
-    Continuously reads frames from the webcam in a background thread and
-    puts them into a queue.  This decouples frame acquisition from the UI
-    tick rate, keeping the preview smooth even during countdown waits.
-    """
     def __init__(self, cap, frame_queue: queue.Queue):
         super().__init__(daemon=True)
         self.cap         = cap
@@ -330,14 +363,13 @@ class CameraThread(threading.Thread):
         while not self._stop_event.is_set():
             ret, frame = self.cap.read()
             if ret:
-                # Keep only the latest frame — discard stale ones
                 while not self.frame_queue.empty():
                     try:
                         self.frame_queue.get_nowait()
                     except queue.Empty:
                         break
                 self.frame_queue.put(frame)
-            time.sleep(0.01)   # ~100 fps cap, well above display rate
+            time.sleep(0.01)
 
     def stop(self):
         self._stop_event.set()
@@ -357,6 +389,7 @@ class WebcamPrintApp:
     ACCENT   = "#cba6f7"
     RED      = "#f38ba8"
     GREEN    = "#a6e3a1"
+    YELLOW   = "#f9e2af"
     MUTED    = "#585b70"
     INPUT_BG = "#45475a"
 
@@ -376,27 +409,36 @@ class WebcamPrintApp:
         self._after_id      = None
 
         # Sequence state
-        self._sequence_active = False
-        self._burst_remaining = 0
-        self._sequence_after  = None
-        # Current countdown digit — shared between timer tick and display loop
-        self._countdown_overlay = None   # None = no overlay; int = show digit
+        self._sequence_active   = False
+        self._burst_remaining   = 0
+        self._sequence_after    = None
+        self._countdown_overlay = None   # int digit or None
 
-        # ── Caption vars ──────────────────────────────────────────────
+        # ── Caption ───────────────────────────────────────────────────
         self.caption_enabled  = tk.BooleanVar(value=True)
         self.caption_font     = tk.StringVar(value="Impact")
         self.caption_size     = tk.IntVar(value=72)
         self.caption_position = tk.StringVar(value="Bottom Centre")
 
-        # ── Countdown & burst vars ────────────────────────────────────
+        # ── Countdown / burst ─────────────────────────────────────────
         self.countdown_enabled = tk.BooleanVar(value=False)
         self.burst_enabled     = tk.BooleanVar(value=False)
 
-        # ── Effect & mirror vars ──────────────────────────────────────
-        self.effect_name   = tk.StringVar(value="None")
+        # ── Effect / mirror / grayscale ───────────────────────────────
+        self.effect_name    = tk.StringVar(value="None")
         self.mirror_enabled = tk.BooleanVar(value=True)
+        self.grayscale_enabled = tk.BooleanVar(value=False)
 
-        # ── Save var ──────────────────────────────────────────────────
+        # ── Timestamp ─────────────────────────────────────────────────
+        self.timestamp_enabled = tk.BooleanVar(value=False)
+
+        # ── Image adjustments  (all default to 0 = neutral) ──────────
+        self.adj_brightness = tk.DoubleVar(value=0)
+        self.adj_contrast   = tk.DoubleVar(value=0)
+        self.adj_exposure   = tk.DoubleVar(value=0)
+        self.adj_shadows    = tk.DoubleVar(value=0)
+
+        # ── Save ──────────────────────────────────────────────────────
         self.save_enabled = tk.BooleanVar(value=True)
 
         self._build_ui()
@@ -419,133 +461,153 @@ class WebcamPrintApp:
         self._refresh_live_preview()
 
     def _on_caption_return(self, event=None):
-        content = self.entry_caption.get("1.0", "end-1c")
-        if content.count("\n") >= 2:
+        if self.entry_caption.get("1.0", "end-1c").count("\n") >= 2:
             return "break"
-        return None
 
     # ------------------------------------------------------------------
-    # UI construction
+    # UI
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
-        BG     = self.BG
-        CARD   = self.CARD
-        FG     = self.FG
-        ACCENT = self.ACCENT
-        RED    = self.RED
-        GREEN  = self.GREEN
-        MUTED  = self.MUTED
-        IB     = self.INPUT_BG
+        BG    = self.BG;  CARD  = self.CARD;  FG    = self.FG
+        ACCENT= self.ACCENT; RED = self.RED; GREEN = self.GREEN
+        YELLOW= self.YELLOW; MUTED = self.MUTED; IB = self.INPUT_BG
 
         # ── Header ────────────────────────────────────────────────────
-        header = tk.Frame(self.root, bg=BG, pady=10)
-        header.pack(fill="x")
-        tk.Label(header, text="📷  Photo Booth  📷",
+        hdr = tk.Frame(self.root, bg=BG, pady=10)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="📷  Photo Booth  📷",
                  font=("Segoe UI", 18, "bold"), fg=ACCENT, bg=BG).pack()
 
         # ── Camera canvas ─────────────────────────────────────────────
-        canvas_frame = tk.Frame(self.root, bg=CARD, padx=4, pady=4)
-        canvas_frame.pack(padx=20, pady=(0, 0))
-        self.canvas = tk.Canvas(canvas_frame,
-                                width=self.PREVIEW_W, height=self.PREVIEW_H,
+        cf = tk.Frame(self.root, bg=CARD, padx=4, pady=4)
+        cf.pack(padx=20, pady=(0, 0))
+        self.canvas = tk.Canvas(cf, width=self.PREVIEW_W, height=self.PREVIEW_H,
                                 bg="#11111b", highlightthickness=0)
         self.canvas.pack()
-        self.canvas.create_text(
-            self.PREVIEW_W // 2, self.PREVIEW_H // 2,
-            text="Connecting to camera…",
-            fill=MUTED, font=("Segoe UI", 16), tag="placeholder",
-        )
+        self.canvas.create_text(self.PREVIEW_W // 2, self.PREVIEW_H // 2,
+                                text="Connecting to camera…",
+                                fill=MUTED, font=("Segoe UI", 16), tag="placeholder")
 
-        # ── Style comboboxes once ─────────────────────────────────────
+        # ── Combobox style ────────────────────────────────────────────
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("TCombobox",
-                         fieldbackground=IB, background=IB,
-                         foreground=FG, selectbackground=IB,
-                         selectforeground=FG, arrowcolor=FG)
+                         fieldbackground=IB, background=IB, foreground=FG,
+                         selectbackground=IB, selectforeground=FG, arrowcolor=FG)
         combo_cfg = dict(state="readonly", font=("Segoe UI", 10),
                          background=IB, foreground=CARD)
 
         # ── Controls panel ────────────────────────────────────────────
-        cap_outer = tk.Frame(self.root, bg=CARD, padx=10, pady=6)
-        cap_outer.pack(fill="x", padx=20, pady=(4, 0))
+        outer = tk.Frame(self.root, bg=CARD, padx=10, pady=6)
+        outer.pack(fill="x", padx=20, pady=(4, 0))
 
-        #
-        # Single row: [Caption chk] [Text entry] | [stacked selectors] | [toggles]
-        #
-        row0 = tk.Frame(cap_outer, bg=CARD)
-        row0.pack(fill="x")
+        row = tk.Frame(outer, bg=CARD)
+        row.pack(fill="x")
 
-        # ── Left: Caption toggle + text entry ─────────────────────────
-        left_col = tk.Frame(row0, bg=CARD)
-        left_col.pack(side="left", anchor="n")
+        chk_cfg = dict(bg=CARD, activebackground=CARD, selectcolor=BG,
+                       font=("Segoe UI", 10, "bold"), cursor="hand2", anchor="w")
+        lbl_cfg = dict(font=("Segoe UI", 9), fg=MUTED, bg=CARD, anchor="w")
 
-        self.chk_caption = tk.Checkbutton(
-            left_col, text="Caption", variable=self.caption_enabled,
-            font=("Segoe UI", 10, "bold"), fg=ACCENT, bg=CARD,
-            activebackground=CARD, selectcolor=BG, cursor="hand2",
-            command=self._refresh_live_preview,
-        )
-        self.chk_caption.pack(anchor="w")
+        # ── Col A: Caption + text entry ───────────────────────────────
+        col_a = tk.Frame(row, bg=CARD)
+        col_a.pack(side="left", anchor="n", padx=(0, 6))
 
+        tk.Checkbutton(col_a, text="Caption", variable=self.caption_enabled,
+                        fg=ACCENT, command=self._refresh_live_preview,
+                        **chk_cfg).pack(anchor="w")
         self.entry_caption = tk.Text(
-            left_col,
-            font=("Segoe UI", 11), bg=IB, fg=FG,
+            col_a, font=("Segoe UI", 11), bg=IB, fg=FG,
             insertbackground=FG, relief="flat", bd=4,
-            height=3, width=32, wrap="word",
-        )
+            height=3, width=28, wrap="word")
         self.entry_caption.pack(anchor="w")
         self.entry_caption.bind("<KeyRelease>", self._on_caption_key)
         self.entry_caption.bind("<Return>",     self._on_caption_return)
 
-        # ── Middle: vertically stacked Font / Size / Position ─────────
-        mid_col = tk.Frame(row0, bg=CARD, padx=10)
-        mid_col.pack(side="left", anchor="n")
+        # ── Col B: Caption options stacked ────────────────────────────
+        col_b = tk.Frame(row, bg=CARD, padx=6)
+        col_b.pack(side="left", anchor="n")
 
-        def sel_row(parent, label_text, widget_factory):
-            r = tk.Frame(parent, bg=CARD, pady=2)
+        def sel_row(parent, label, var, values, w):
+            r = tk.Frame(parent, bg=CARD, pady=1)
             r.pack(fill="x")
-            tk.Label(r, text=label_text, font=("Segoe UI", 9),
-                     fg=MUTED, bg=CARD, width=7, anchor="w").pack(side="left")
-            widget_factory(r).pack(side="left")
+            tk.Label(r, text=label, width=7, **lbl_cfg).pack(side="left")
+            cmb = ttk.Combobox(r, textvariable=var, values=values,
+                                width=w, **combo_cfg)
+            cmb.pack(side="left")
+            cmb.bind("<<ComboboxSelected>>", lambda _: self._refresh_live_preview())
+            return cmb
 
-        sel_row(mid_col, "Font",
-                lambda p: self._make_combo(p, self.caption_font,
-                                           sorted(FONTS.keys()), 14, combo_cfg))
-        sel_row(mid_col, "Size",
-                lambda p: self._make_combo(p, self.caption_size,
-                                           FONT_SIZES, 5, combo_cfg))
-        sel_row(mid_col, "Position",
-                lambda p: self._make_combo(p, self.caption_position,
-                                           CAPTION_POSITIONS, 14, combo_cfg))
-        sel_row(mid_col, "Effect",
-                lambda p: self._make_combo(p, self.effect_name,
-                                           EFFECT_DISPLAY_NAMES, 14, combo_cfg))
+        sel_row(col_b, "Font",     self.caption_font,     sorted(FONTS.keys()), 14)
+        sel_row(col_b, "Size",     self.caption_size,     FONT_SIZES,            5)
+        sel_row(col_b, "Position", self.caption_position, CAPTION_POSITIONS,    14)
+        sel_row(col_b, "Effect",   self.effect_name,      EFFECT_DISPLAY_NAMES, 13)
 
-        # ── Right: toggles ────────────────────────────────────────────
-        right_col = tk.Frame(row0, bg=CARD, padx=6)
-        right_col.pack(side="left", anchor="n")
+        # ── Col C: Toggles ────────────────────────────────────────────
+        col_c = tk.Frame(row, bg=CARD, padx=6)
+        col_c.pack(side="left", anchor="n")
 
-        chk_cfg = dict(bg=CARD, activebackground=CARD, selectcolor=BG,
-                       font=("Segoe UI", 10, "bold"), cursor="hand2",
-                       anchor="w")
+        tk.Checkbutton(col_c, text=f"⏱ Countdown ({COUNTDOWN_SECONDS}s)",
+                        variable=self.countdown_enabled, fg=GREEN, **chk_cfg
+                        ).pack(fill="x", pady=1)
+        tk.Checkbutton(col_c, text=f"💥 Burst ({BURST_COUNT} shots)",
+                        variable=self.burst_enabled, fg=ACCENT, **chk_cfg
+                        ).pack(fill="x", pady=1)
+        tk.Checkbutton(col_c, text="🪞 Mirror",
+                        variable=self.mirror_enabled, fg=FG,
+                        command=self._refresh_live_preview, **chk_cfg
+                        ).pack(fill="x", pady=1)
+        tk.Checkbutton(col_c, text="⬛ Grayscale",
+                        variable=self.grayscale_enabled, fg=FG,
+                        command=self._refresh_live_preview, **chk_cfg
+                        ).pack(fill="x", pady=1)
+        tk.Checkbutton(col_c, text="🕐 Timestamp",
+                        variable=self.timestamp_enabled, fg=YELLOW,
+                        command=self._refresh_live_preview, **chk_cfg
+                        ).pack(fill="x", pady=1)
 
-        tk.Checkbutton(
-            right_col, text=f"⏱ Countdown ({COUNTDOWN_SECONDS}s)",
-            variable=self.countdown_enabled, fg=GREEN, **chk_cfg,
-        ).pack(fill="x", pady=1)
+        # ── Col D: Image adjustments ──────────────────────────────────
+        col_d = tk.Frame(row, bg=CARD, padx=8)
+        col_d.pack(side="left", anchor="n")
 
-        tk.Checkbutton(
-            right_col, text=f"💥 Burst ({BURST_COUNT} shots)",
-            variable=self.burst_enabled, fg=ACCENT, **chk_cfg,
-        ).pack(fill="x", pady=1)
+        tk.Label(col_d, text="Image Adjustments",
+                 font=("Segoe UI", 9, "bold"), fg=MUTED, bg=CARD
+                 ).pack(anchor="w", pady=(0, 2))
 
-        tk.Checkbutton(
-            right_col, text="🪞 Mirror",
-            variable=self.mirror_enabled, fg=FG,
-            command=self._refresh_live_preview, **chk_cfg,
-        ).pack(fill="x", pady=1)
+        def adj_row(parent, label, var, frm=-100, to=100):
+            r = tk.Frame(parent, bg=CARD)
+            r.pack(fill="x", pady=1)
+            tk.Label(r, text=label, width=11, **lbl_cfg).pack(side="left")
+            sl = tk.Scale(
+                r, variable=var, from_=frm, to=to,
+                orient="horizontal", length=160,
+                bg=CARD, fg=FG, troughcolor=IB,
+                highlightthickness=0, bd=0,
+                showvalue=False, resolution=1,
+                command=lambda _: self._refresh_live_preview(),
+            )
+            sl.pack(side="left")
+            # Live value label
+            val_lbl = tk.Label(r, textvariable=var, width=4,
+                                font=("Segoe UI", 8), fg=MUTED, bg=CARD)
+            val_lbl.pack(side="left")
+            # Reset button
+            tk.Button(r, text="↺", font=("Segoe UI", 8), fg=MUTED, bg=CARD,
+                       relief="flat", cursor="hand2", bd=0,
+                       command=lambda v=var: (v.set(0), self._refresh_live_preview())
+                       ).pack(side="left", padx=(2, 0))
+
+        adj_row(col_d, "Brightness", self.adj_brightness)
+        adj_row(col_d, "Contrast",   self.adj_contrast)
+        adj_row(col_d, "Exposure",   self.adj_exposure)
+        adj_row(col_d, "Shadows",    self.adj_shadows)
+
+        # Reset all button
+        tk.Button(col_d, text="Reset All", font=("Segoe UI", 8, "bold"),
+                   fg=MUTED, bg=self.INPUT_BG, relief="flat", cursor="hand2", bd=0,
+                   padx=4, pady=2,
+                   command=self._reset_adjustments
+                   ).pack(anchor="e", pady=(4, 0))
 
         # ── Status bar ────────────────────────────────────────────────
         self.status_var = tk.StringVar(value="Starting camera…")
@@ -554,37 +616,35 @@ class WebcamPrintApp:
                  anchor="w", padx=10).pack(fill="x", pady=(4, 0))
 
         # ── Capture button ────────────────────────────────────────────
-        btn_frame = tk.Frame(self.root, bg=BG, pady=10)
-        btn_frame.pack()
+        bf = tk.Frame(self.root, bg=BG, pady=10)
+        bf.pack()
         self.btn_capture = tk.Button(
-            btn_frame, text="📸",
-            bg=RED, fg=BG,
+            bf, text="📸", bg=RED, fg=BG,
             font=("Segoe UI", 22), relief="flat",
             cursor="hand2", padx=5, pady=0, bd=0,
-            command=self._on_capture_pressed,
-        )
+            command=self._on_capture_pressed)
         self.btn_capture.pack()
 
         # ── Printer label ─────────────────────────────────────────────
         try:
-            printer_name = win32print.GetDefaultPrinter()
+            pn = win32print.GetDefaultPrinter()
         except Exception:
-            printer_name = "Unknown"
-        info_frame = tk.Frame(self.root, bg=BG, pady=2)
-        info_frame.pack()
-        tk.Label(info_frame, text=f"Default printer:  {printer_name}",
+            pn = "Unknown"
+        pf = tk.Frame(self.root, bg=BG, pady=2)
+        pf.pack()
+        tk.Label(pf, text=f"Default printer:  {pn}",
                  font=("Segoe UI", 9), fg=MUTED, bg=BG).pack()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _make_combo(self, parent, var, values, width, combo_cfg):
-        cmb = ttk.Combobox(parent, textvariable=var, values=values,
-                            width=width, **combo_cfg)
-        cmb.bind("<<ComboboxSelected>>", lambda _: self._refresh_live_preview())
-        return cmb
+    def _reset_adjustments(self):
+        for v in (self.adj_brightness, self.adj_contrast,
+                  self.adj_exposure, self.adj_shadows):
+            v.set(0)
+        self._refresh_live_preview()
 
     # ------------------------------------------------------------------
-    # Frame composition
+    # Frame composition pipeline
     # ------------------------------------------------------------------
 
     def _caption_params(self):
@@ -597,31 +657,57 @@ class WebcamPrintApp:
 
     def _compose_frame(self, bgr_frame, countdown_num=None) -> Image.Image:
         """
-        Pipeline:
-          1. Apply selected camera effect  (numpy/cv2)
-          2. Mirror if enabled             (numpy)
-          3. Convert to PIL RGB
-          4. Apply caption                 (Pillow) — caption never affected by effects
-          5. Optionally overlay countdown digit (Pillow, preview only)
+        Full pipeline (BGR numpy → PIL RGB):
+          1. Camera effect  (distortion)
+          2. Mirror
+          3. Image adjustments (brightness / contrast / exposure / shadows)
+          4. Grayscale
+          5. → PIL RGB
+          6. Caption  (text, not affected by effects)
+          7. Timestamp
+          8. Countdown overlay  (preview only)
         """
+        frame = bgr_frame.copy()
+
         # 1. Effect
         effect_key = EFFECT_KEYS.get(self.effect_name.get(), "none")
-        frame = apply_effect(bgr_frame, effect_key)
+        frame = apply_effect(frame, effect_key)
 
         # 2. Mirror
         if self.mirror_enabled.get():
             frame = cv2.flip(frame, 1)
 
-        # 3. PIL
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil = Image.fromarray(rgb)
+        # 3. Image adjustments
+        adj_needed = any(v.get() != 0 for v in (
+            self.adj_brightness, self.adj_contrast,
+            self.adj_exposure, self.adj_shadows))
+        if adj_needed:
+            frame = apply_adjustments(
+                frame,
+                brightness = self.adj_brightness.get(),
+                contrast   = self.adj_contrast.get(),
+                exposure   = self.adj_exposure.get(),
+                shadows    = self.adj_shadows.get(),
+            )
 
-        # 4. Caption
+        # 4. Grayscale
+        if self.grayscale_enabled.get():
+            gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            frame = cv2.cvtColor(gray,  cv2.COLOR_GRAY2BGR)
+
+        # 5. → PIL
+        pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+
+        # 6. Caption
         p = self._caption_params()
         if p["text"].strip():
             pil = _apply_caption(pil, **p)
 
-        # 5. Countdown digit (preview only — caller decides)
+        # 7. Timestamp
+        if self.timestamp_enabled.get():
+            pil = _apply_timestamp(pil)
+
+        # 8. Countdown (preview only — caller passes None for printable frames)
         if countdown_num is not None:
             pil = _apply_countdown(pil, countdown_num)
 
@@ -633,7 +719,7 @@ class WebcamPrintApp:
             self._display_pil(self._compose_frame(frame))
 
     # ------------------------------------------------------------------
-    # Camera — background thread feeds a queue; UI polls the queue
+    # Camera — background thread + UI poll loop
     # ------------------------------------------------------------------
 
     def _start_camera(self) -> None:
@@ -648,24 +734,16 @@ class WebcamPrintApp:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
         self.cap = cap
-
         self._cam_thread = CameraThread(cap, self._frame_queue)
         self._cam_thread.start()
         self.running = True
-
         self.root.after(0, self._schedule_frame)
         self.root.after(0, lambda: self.status_var.set(
             "✅  Camera ready — press 📸 to capture & print"))
 
     def _schedule_frame(self) -> None:
-        """
-        UI polling loop — runs at ~30 fps regardless of countdown state.
-        During a sequence it still reads the queue so the preview stays live;
-        it just also overlays the countdown digit if one is pending.
-        """
         if not self.running:
             return
-
         if not self.preview_frozen:
             try:
                 frame = self._frame_queue.get_nowait()
@@ -674,8 +752,7 @@ class WebcamPrintApp:
                     self._compose_frame(frame, countdown_num=self._countdown_overlay)
                 )
             except queue.Empty:
-                pass   # nothing new from camera yet — keep old frame on screen
-
+                pass
         self._after_id = self.root.after(33, self._schedule_frame)
 
     def _display_pil(self, pil_img: Image.Image) -> None:
@@ -686,10 +763,8 @@ class WebcamPrintApp:
         tk_img  = ImageTk.PhotoImage(preview)
         self.canvas._tk_img = tk_img
         self.canvas.delete("all")
-        self.canvas.create_image(
-            self.PREVIEW_W // 2, self.PREVIEW_H // 2,
-            anchor="center", image=tk_img,
-        )
+        self.canvas.create_image(self.PREVIEW_W // 2, self.PREVIEW_H // 2,
+                                  anchor="center", image=tk_img)
 
     # ------------------------------------------------------------------
     # Capture / countdown / burst
@@ -716,44 +791,42 @@ class WebcamPrintApp:
             self._countdown_overlay = None
             self._do_capture_and_print()
             return
-
-        # Set the shared overlay value — _schedule_frame will pick it up
         self._countdown_overlay = seconds_left
         self.status_var.set(f"⏱  Get ready… {seconds_left}")
+        play_async(_play_beep)
         self._sequence_after = self.root.after(
-            1000, lambda: self._run_countdown(seconds_left - 1)
-        )
+            1000, lambda: self._run_countdown(seconds_left - 1))
 
     def _run_inter_burst_countdown(self, seconds_left: int) -> None:
         if seconds_left <= 0:
             self._countdown_overlay = None
             self._do_capture_and_print()
             return
-
         self._countdown_overlay = seconds_left
         self.status_var.set(f"💥  Next burst shot in {seconds_left}…")
+        play_async(_play_beep)
         self._sequence_after = self.root.after(
-            1000, lambda: self._run_inter_burst_countdown(seconds_left - 1)
-        )
+            1000, lambda: self._run_inter_burst_countdown(seconds_left - 1))
 
     def _do_capture_and_print(self) -> None:
-        # Grab the very latest frame from the queue (don't use a stale one)
+        # Grab the freshest available frame
         try:
             frame = self._frame_queue.get_nowait()
             self.last_frame = frame
         except queue.Empty:
             frame = self.last_frame
-
         if frame is None:
             self._end_sequence()
             return
 
         self.frozen_frame = frame.copy()
 
-        # Compose WITHOUT countdown overlay — this is what gets printed
+        # Compose WITHOUT countdown overlay
         composited = self._compose_frame(frame, countdown_num=None)
         self.preview_frozen = True
         self._display_pil(composited)
+
+        play_async(_play_capture)
 
         shot_num   = (BURST_COUNT - self._burst_remaining + 1) if self.burst_enabled.get() else 1
         burst_info = f" ({shot_num}/{BURST_COUNT})" if self.burst_enabled.get() else ""
@@ -763,46 +836,42 @@ class WebcamPrintApp:
             try:
                 cv2.imwrite(
                     datetime.now().strftime("%Y%m%d-%H%M%S") + ".jpg",
-                    self.frozen_frame,
-                )
+                    self.frozen_frame)
             except Exception:
                 pass
 
         self._burst_remaining -= 1
 
-        threading.Thread(
-            target=self._do_print,
-            args=(composited.copy(), self._burst_remaining),
-            daemon=True,
-        ).start()
+        threading.Thread(target=self._do_print,
+                          args=(composited.copy(), self._burst_remaining),
+                          daemon=True).start()
 
-    def _do_print(self, pil_image: Image.Image, burst_remaining: int) -> None:
+    def _do_print(self, pil_image, burst_remaining):
         try:
             print_image(pil_image)
             self.root.after(0, lambda: self._after_print(burst_remaining))
         except Exception as exc:
             self.root.after(0, lambda: self._print_error(str(exc)))
 
-    def _after_print(self, burst_remaining: int) -> None:
+    def _after_print(self, burst_remaining):
         self.preview_frozen = False
         if burst_remaining > 0:
             self._run_inter_burst_countdown(BURST_DELAY)
         else:
             shots = BURST_COUNT if self.burst_enabled.get() else 1
-            msg   = (f"✅  {shots} prints sent — ready for next round!"
-                     if shots > 1 else
-                     "✅  Print job sent — ready for next shot!")
-            self.status_var.set(msg)
+            self.status_var.set(
+                f"✅  {shots} prints sent — ready for next round!" if shots > 1
+                else "✅  Print job sent — ready for next shot!")
             self._end_sequence()
 
-    def _end_sequence(self) -> None:
+    def _end_sequence(self):
         self._sequence_active   = False
         self._countdown_overlay = None
         self.preview_frozen     = False
         self.frozen_frame       = None
         self.btn_capture.config(state="normal")
 
-    def _print_error(self, msg: str) -> None:
+    def _print_error(self, msg):
         self.status_var.set(f"❌  Print failed: {msg}")
         messagebox.showerror("Print Error", f"Could not print:\n\n{msg}")
         self._end_sequence()
@@ -811,7 +880,7 @@ class WebcamPrintApp:
     # Cleanup
     # ------------------------------------------------------------------
 
-    def _on_close(self) -> None:
+    def _on_close(self):
         self.running = False
         if self._after_id:
             self.root.after_cancel(self._after_id)
@@ -828,7 +897,7 @@ class WebcamPrintApp:
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
+def main():
     root = tk.Tk()
     WebcamPrintApp(root)
     root.mainloop()
