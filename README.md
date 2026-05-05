@@ -4,4 +4,4 @@ Having a party?  Leave this in a corner and let your friends go wild.
 
 dependencies: pip install opencv-python Pillow pywin32 numpy
 
-<img width="1327" height="1049" alt="image" src="https://github.com/user-attachments/assets/e3519c5e-a8e5-40e3-82e8-25da5526cfde" />
+<img width="866" height="829" alt="image" src="https://github.com/user-attachments/assets/08fb14ef-1ac4-4a53-abd7-a451cbb180af" />
