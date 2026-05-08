@@ -1,0 +1,3 @@
+pip install opencv-python Pillow pywin32
+
+numpy? probably not

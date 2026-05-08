@@ -674,7 +674,7 @@ class WebcamPrintApp:
         self.btn_settings.configure(bg=BG, fg=MUTED)
         self.w_canvas_frame.configure(bg=CARD,
                                        padx=60 if flash else 4,
-                                       pady=60 if flash else 4)
+                                       pady=30 if flash else 4)
         self.canvas.configure(bg="white" if flash else "#11111b")
 
         # Controls panel background
@@ -735,28 +735,69 @@ class WebcamPrintApp:
     # ------------------------------------------------------------------
 
     def _on_camera_change(self):
+        """
+        Called on the UI thread when the user picks a new camera.
+
+        Order of operations matters:
+          1. Stop the schedule loop and cancel any pending after() — must happen
+             on the UI thread before we touch the cap or the queue.
+          2. Stop and join the CameraThread (blocks briefly — done on bg thread).
+          3. Release old cap and open new one (slow I/O — bg thread).
+          4. Restart CameraThread and schedule loop — signalled back to UI thread
+             via root.after() so Tk is never touched from the bg thread.
+        """
         label = self.camera_index_var.get()
         idx   = int(label.split()[-1]) if label else 0
-        threading.Thread(target=self._switch_camera, args=(idx,), daemon=True).start()
 
-    def _switch_camera(self, idx):
+        # ── Step 1: halt the UI polling loop immediately ──────────────
         self.running = False
-        if self._cam_thread:
-            self._cam_thread.stop(); self._cam_thread.join(timeout=1)
-        if self.cap: self.cap.release()
-        cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
-        if not cap.isOpened():
-            self.root.after(0, lambda: self.status_var.set("❌  Could not open camera."))
-            return
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.cap = cap
+        if self._after_id:
+            self.root.after_cancel(self._after_id)
+            self._after_id = None
+
+        self.status_var.set("🔄  Switching camera…")
+
+        # ── Steps 2-3: slow work off the UI thread ────────────────────
+        old_thread = self._cam_thread
+        old_cap    = self.cap
+        self._cam_thread = None
+        self.cap         = None
+
+        def _do_switch():
+            # Stop + join old camera thread (safe — running=False means it
+            # will drain quickly)
+            if old_thread:
+                old_thread.stop()
+                old_thread.join(timeout=2)
+            if old_cap:
+                old_cap.release()
+
+            cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                self.root.after(0, lambda: self.status_var.set(
+                    "❌  Could not open selected camera."))
+                return
+
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+
+            # ── Step 4: hand new cap back to UI thread ────────────────
+            self.root.after(0, lambda: self._finish_camera_switch(cap))
+
+        threading.Thread(target=_do_switch, daemon=True).start()
+
+    def _finish_camera_switch(self, cap):
+        """
+        Called on the UI thread once the new cap is ready.
+        Starts the new CameraThread and restarts the schedule loop.
+        """
+        self.cap          = cap
         self._frame_queue = queue.Queue(maxsize=2)
         self._cam_thread  = CameraThread(cap, self._frame_queue)
         self._cam_thread.start()
         self.running = True
-        self.root.after(0, lambda: self.status_var.set(
-            "✅  Camera ready — press 📸 or Space to capture & print"))
+        self._schedule_frame()   # restart the UI poll loop
+        self.status_var.set("✅  Camera ready — press 📸 or Space to capture & print")
 
     # ------------------------------------------------------------------
     # Frame composition
